@@ -30,8 +30,10 @@
 #include <hackrf.h>
 
 #include <errno.h>
+#include <fftw3.h>
 #include <getopt.h>
 #include <inttypes.h>
+#include <math.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -111,9 +113,9 @@ typedef enum {
 	RTL_TCP_COMMAND_SET_TUNER_XTAL = RTL_TCP_COMMAND_BASE + 0x0c,
 	RTL_TCP_COMMAND_SET_TUNER_GAIN_INDEX = RTL_TCP_COMMAND_BASE + 0x0d,
 	RTL_TCP_COMMAND_SET_BIAS_TEE = RTL_TCP_COMMAND_BASE + 0x0e,
-	HACKRF_TCP_COMMAND_SET_AMP = HACKRF_TCP_COMMAND_BASE + 0x00,
 	HACKRF_TCP_COMMAND_SET_LNA_GAIN = HACKRF_TCP_COMMAND_BASE + 1,
 	HACKRF_TCP_COMMAND_SET_VGA_GAIN = HACKRF_TCP_COMMAND_BASE + 2,
+	HACKRF_TCP_COMMAND_SET_SAMPLE_FORMAT = HACKRF_TCP_COMMAND_BASE + 3,
 } rtl_tcp_commands_t;
 
 typedef enum {
@@ -171,10 +173,24 @@ static int global_numq = 0;
 static struct llist* ll_buffers = 0;
 static uint32_t llbuf_num = DEFAULT_MAX_NUM_BUFFERS;
 static sdr_sample_format_t sample_format = SDR_SAMPLE_FORMAT_UINT8;
+static int fft_rate = 0;
 
 static volatile bool do_exit = false;
 static bool enable_verbose = false;
 static bool enable_extended = false;
+
+struct fftw_info {
+	fftwf_complex* in;
+	fftwf_complex* out;
+	fftwf_plan plan;
+	int input_len;
+	int size;
+	int db_offset;
+	int db_range;
+	float* window;
+	float* row32;
+	uint8_t* row8;
+} fftw;
 
 double atofs(const char* s)
 {
@@ -296,19 +312,73 @@ int rx_callback(hackrf_transfer* transfer)
 		return HACKRF_SUCCESS;
 	}
 
+	if (sample_format == SDR_SAMPLE_FORMAT_INT8 + 0x80) {
+		// Skip 75% bandwidth
+		if (fft_rate++ % 4 != 0)
+			return HACKRF_SUCCESS;
+	}
+
 	struct llist* rpt = (struct llist*) malloc(sizeof(struct llist));
-	rpt->data = (char*) malloc(transfer->buffer_length);
-	memcpy(rpt->data, transfer->buffer, transfer->buffer_length);
-	rpt->len = transfer->buffer_length;
-	rpt->next = NULL;
 
 	if (sample_format == SDR_SAMPLE_FORMAT_UINT8) {
 		// HackRF One returns signed IQ values, convert them to unsigned
 		// This workaround greatly increases CPU usage
 		int i;
-		for (i = 0; i < rpt->len; i++) {
-			rpt->data[i] ^= (uint8_t) 0x80;
+		for (i = 0; i < transfer->valid_length; i++) {
+			transfer->buffer[i] ^= (uint8_t) 0x80;
 		}
+	}
+
+	if (sample_format < 0x80) {
+		rpt->data = (char*) malloc(transfer->valid_length);
+		memcpy(rpt->data, transfer->buffer, transfer->valid_length);
+		rpt->len = transfer->valid_length;
+		rpt->next = NULL;
+	} else {
+		// Apply FFT to samples
+		int i;
+		for (i = 0; i < fftw.input_len; i++) {
+			uint8_t vi = transfer->buffer[i * 2];
+			uint8_t vq = transfer->buffer[i * 2 + 1];
+			vi ^= (uint8_t) 0x80; // HackRF signed IQ values
+			vq ^= (uint8_t) 0x80; // converted to unsigned
+			fftw.in[i][0] = powf(-1, i) * vi / 0x100;
+			fftw.in[i][1] = powf(-1, i) * vq / 0x100;
+		}
+
+		// Compute FFT (convert the complex samples to complex frequency domain)
+		fftwf_execute(fftw.plan);
+
+		/*
+		rpt->data = (char*) malloc(fftw.size * 8);
+		memcpy(rpt->data, fftw.out, fftw.size * 8);
+		rpt->len = fftw.size * 8;
+		rpt->next = NULL;
+		*/
+
+		// Compute log magnitude in decibels
+		float val;
+		float db_offset = fftw.db_offset - 10.0f * log10f(fftw.size / 2) - 15.5f;
+		for (i = 0; i < fftw.size; i++) {
+			float ci = fftw.out[i][0];
+			float cq = fftw.out[i][1];
+			val = ci * ci + cq * cq;
+			val = 10.0f * log10f(1e-12f + val);
+			fftw.row32[i] = val + db_offset; // <-- db
+		}
+
+		// Scale decibels to unsigned 8-bit range and clamp the value
+		for (i = 0; i < fftw.size; i++) {
+			// Range 0-255 covers -127..0 dB in 0.5 dB steps
+			val = 2 * (fftw.row32[i] + fftw.db_range);
+			val = val < 0 ? 0 : (val > 255 ? 255 : val);
+			fftw.row8[i] = (uint8_t) val; // <-- pow
+		}
+
+		rpt->data = (char*) malloc(fftw.size);
+		memcpy(rpt->data, fftw.row8, fftw.size);
+		rpt->len = fftw.size;
+		rpt->next = NULL;
 	}
 
 	pthread_mutex_lock(&ll_mutex);
@@ -347,6 +417,57 @@ int rx_callback(hackrf_transfer* transfer)
 	pthread_mutex_unlock(&ll_mutex);
 
 	return HACKRF_SUCCESS;
+}
+
+float* windowinginit(int N)
+{
+	int i;
+
+	// blackman windowing values
+	float c0 = 7938.0 / 18608.0;
+	float c1 = 9240.0 / 18608.0;
+	float c2 = 1430.0 / 18608.0;
+	float c3 = 0;
+
+	float* w = (float*) calloc(N, sizeof(float));
+	for (i = 0; i < N; i++) {
+		double c = M_PI * (double) i / (double) (N - 1);
+		w[i] = c0 - c1 * cos(2.0 * c) + c2 * cos(4.0 * c) - c3 * cos(6.0 * c);
+	}
+
+	return w;
+}
+
+static void fftw_init()
+{
+	fftw.input_len = 131072;
+	fftw.size = 1024 * 16;
+	fftw.db_offset = 0;
+	fftw.db_range = 127;
+	fftw.in = (fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex) * fftw.input_len);
+	fftw.out = (fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex) * fftw.size);
+	fftw.plan = fftwf_plan_dft_1d(
+		fftw.size,
+		fftw.in,
+		fftw.out,
+		FFTW_FORWARD,
+		FFTW_MEASURE);
+	fftw.window = windowinginit(fftw.input_len);
+	fftw.row32 = (float*) malloc(sizeof(float) * fftw.size);
+	memset(fftw.row32, 0, sizeof(float) * fftw.size);
+	fftw.row8 = (uint8_t*) malloc(sizeof(uint8_t) * fftw.size);
+	memset(fftw.row8, 0, sizeof(uint8_t) * fftw.size);
+}
+
+static void fftw_exit()
+{
+	fftwf_destroy_plan(fftw.plan);
+	fftwf_free(fftw.in);
+	fftwf_free(fftw.out);
+	fftwf_free(fftw.window);
+	free(fftw.row32);
+	free(fftw.row8);
+	fftwf_cleanup();
 }
 
 static void* tcp_worker(void* arg)
@@ -539,10 +660,6 @@ static void* command_worker(void* arg)
 			printf("set bias tee %d\n", param);
 			hackrf_set_antenna_enable(device, param);
 			break;
-		case HACKRF_TCP_COMMAND_SET_AMP:
-			printf("set tuner amp %d\n", param);
-			hackrf_set_amp_enable(device, param);
-			break;
 		case HACKRF_TCP_COMMAND_SET_LNA_GAIN:
 			printf("set tuner LNA gain %d\n", param);
 			hackrf_set_lna_gain(device, param);
@@ -550,6 +667,10 @@ static void* command_worker(void* arg)
 		case HACKRF_TCP_COMMAND_SET_VGA_GAIN:
 			printf("set tuner VGA gain %d\n", param);
 			hackrf_set_vga_gain(device, param);
+			break;
+		case HACKRF_TCP_COMMAND_SET_SAMPLE_FORMAT:
+			printf("set sample format 0x%02x\n", param);
+			sample_format = param;
 			break;
 		default:
 			printf("[ignored] unknown command 0x%02x (%d), value %d\n",
@@ -748,6 +869,7 @@ int main(int argc, char** argv)
 	struct sigaction sigact, sigign;
 #endif
 
+	fftw_init();
 	result = hackrf_init();
 	if (result != HACKRF_SUCCESS) {
 		fprintf(stderr,
@@ -1115,6 +1237,7 @@ int main(int argc, char** argv)
 out:
 	hackrf_close(device);
 	hackrf_exit();
+	fftw_exit();
 
 	closesocket(listensocket);
 	closesocket(s);
