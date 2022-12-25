@@ -180,13 +180,16 @@ static bool enable_verbose = false;
 static bool enable_extended = false;
 
 struct fftw_info {
+	int db_offset;
+	int db_range;
+	int iq_size;
+	int fft_size;
+	int size;
 	fftwf_complex* in;
 	fftwf_complex* out;
 	fftwf_plan plan;
-	int input_len;
-	int size;
-	int db_offset;
-	int db_range;
+	bool window_iq_inverted;
+	float window_db_offset;
 	float* window;
 	float* row32;
 	uint8_t* row8;
@@ -313,8 +316,8 @@ int rx_callback(hackrf_transfer* transfer)
 	}
 
 	if (sample_format == SDR_SAMPLE_FORMAT_INT8 + 0x80) {
-		// Skip 75% bandwidth
-		if (fft_rate++ % 4 != 0)
+		// Skip 50% bandwidth
+		if (fft_rate++ % 2 != 0)
 			return HACKRF_SUCCESS;
 	}
 
@@ -337,13 +340,13 @@ int rx_callback(hackrf_transfer* transfer)
 	} else {
 		// Apply FFT to samples
 		int i;
-		for (i = 0; i < fftw.input_len; i++) {
+		for (i = 0; i < fftw.iq_size; i++) {
 			uint8_t vi = transfer->buffer[i * 2];
 			uint8_t vq = transfer->buffer[i * 2 + 1];
 			vi ^= (uint8_t) 0x80; // HackRF signed IQ values
 			vq ^= (uint8_t) 0x80; // converted to unsigned
-			fftw.in[i][0] = powf(-1, i) * vi / 0x100;
-			fftw.in[i][1] = powf(-1, i) * vq / 0x100;
+			fftw.in[i][0] = fftw.window[i] * vi / 0x100;
+			fftw.in[i][1] = fftw.window[i] * vq / 0x100;
 		}
 
 		// Compute FFT (convert the complex samples to complex frequency domain)
@@ -358,21 +361,38 @@ int rx_callback(hackrf_transfer* transfer)
 
 		// Compute log magnitude in decibels
 		float val;
-		float db_offset = fftw.db_offset - 10.0f * log10f(fftw.size / 2) - 15.5f;
-		for (i = 0; i < fftw.size; i++) {
+		float db_offset = fftw.db_offset + fftw.window_db_offset;
+		for (i = 0; i < fftw.fft_size; i++) {
 			float ci = fftw.out[i][0];
 			float cq = fftw.out[i][1];
 			val = ci * ci + cq * cq;
-			val = 10.0f * log10f(1e-12f + val);
+			val = 10.0f * log10f(1e-12f + val) -
+				10.0f * log10f(fftw.fft_size / 2);
 			fftw.row32[i] = val + db_offset; // <-- db
 		}
 
+		// Inline decimation
+		if (fftw.fft_size / fftw.size > 0) {
+			int j, N = fftw.fft_size / fftw.size;
+			for (i = 0; i < fftw.size; i++) {
+				const float* shifted_in = fftw.row32 + N * i;
+				val = 0;
+				for (j = 0; j < N; j++)
+					val += shifted_in[j];
+				fftw.row32[i] = (val / N);
+			}
+		}
+
 		// Scale decibels to unsigned 8-bit range and clamp the value
+		int inverted_i;
 		for (i = 0; i < fftw.size; i++) {
 			// Range 0-255 covers -127..0 dB in 0.5 dB steps
 			val = 2 * (fftw.row32[i] + fftw.db_range);
 			val = val < 0 ? 0 : (val > 255 ? 255 : val);
-			fftw.row8[i] = (uint8_t) val; // <-- pow
+			inverted_i = i;
+			if (fftw.window_iq_inverted)
+				inverted_i = (i + fftw.size / 2) % fftw.size;
+			fftw.row8[inverted_i] = (uint8_t) val; // <-- pow
 		}
 
 		rpt->data = (char*) malloc(fftw.size);
@@ -419,7 +439,7 @@ int rx_callback(hackrf_transfer* transfer)
 	return HACKRF_SUCCESS;
 }
 
-float* windowinginit(int N)
+float* fir_window_init(int N, int window_type)
 {
 	int i;
 
@@ -427,36 +447,27 @@ float* windowinginit(int N)
 	float c0 = 7938.0 / 18608.0;
 	float c1 = 9240.0 / 18608.0;
 	float c2 = 1430.0 / 18608.0;
-	float c3 = 0;
+	float c3 = 0.0f;
+	/*float c0 = 0.54f;
+	float c1 = 0.46f;
+	float c2 = 0.f;
+	float c3 = 0.f;*/
 
 	float* w = (float*) calloc(N, sizeof(float));
 	for (i = 0; i < N; i++) {
 		double c = M_PI * (double) i / (double) (N - 1);
-		w[i] = c0 - c1 * cos(2.0 * c) + c2 * cos(4.0 * c) - c3 * cos(6.0 * c);
+		switch (window_type) {
+		case 0:
+			w[i] = c0 - c1 * cos(2.0 * c) + c2 * cos(4.0 * c) -
+				c3 * cos(6.0 * c);
+			break;
+		default: // case -1:
+			w[i] = powf(-1, i);
+			break;
+		}
 	}
 
 	return w;
-}
-
-static void fftw_init()
-{
-	fftw.input_len = 131072;
-	fftw.size = 1024 * 16;
-	fftw.db_offset = 0;
-	fftw.db_range = 127;
-	fftw.in = (fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex) * fftw.input_len);
-	fftw.out = (fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex) * fftw.size);
-	fftw.plan = fftwf_plan_dft_1d(
-		fftw.size,
-		fftw.in,
-		fftw.out,
-		FFTW_FORWARD,
-		FFTW_MEASURE);
-	fftw.window = windowinginit(fftw.input_len);
-	fftw.row32 = (float*) malloc(sizeof(float) * fftw.size);
-	memset(fftw.row32, 0, sizeof(float) * fftw.size);
-	fftw.row8 = (uint8_t*) malloc(sizeof(uint8_t) * fftw.size);
-	memset(fftw.row8, 0, sizeof(uint8_t) * fftw.size);
 }
 
 static void fftw_exit()
@@ -468,6 +479,60 @@ static void fftw_exit()
 	free(fftw.row32);
 	free(fftw.row8);
 	fftwf_cleanup();
+}
+
+static void fftw_init()
+{
+	int decimation = (1 << 6);
+	float decimation_db_offset;
+	switch (decimation) {
+	case (1 << 0): // 1: no decimation
+		decimation_db_offset = 0.0f;
+		break;
+	case (1 << 1): // 2: 64k --> 32k
+		decimation_db_offset = 2.6f;
+		break;
+	case (1 << 2): // 4: 64k --> 16k
+		decimation_db_offset = 4.8f;
+		break;
+	case (1 << 3): // 8: 64k --> 8k
+		decimation_db_offset = 6.2f;
+		break;
+	case (1 << 4): // 16: 64k --> 4k
+		decimation_db_offset = 7.3f;
+		break;
+	case (1 << 5): // 32: 64k --> 2k
+		decimation_db_offset = 8.0f;
+		break;
+	case (1 << 6): // 64: 64k --> 1k
+		decimation_db_offset = 8.7f;
+		break;
+	default:
+		decimation_db_offset = 0.0f;
+		break;
+	}
+	fftw.db_offset = 0;
+	fftw.db_range = 127;
+	fftw.iq_size = 131072;
+	fftw.fft_size = 1024 * 64;
+	fftw.size = fftw.fft_size / decimation;
+	fftw.in = (fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex) * fftw.iq_size);
+	fftw.out = (fftwf_complex*) fftwf_malloc(sizeof(fftwf_complex) * fftw.fft_size);
+	fftw.plan = fftwf_plan_dft_1d(
+		fftw.fft_size,
+		fftw.in,
+		fftw.out,
+		FFTW_FORWARD,
+		FFTW_MEASURE);
+	fftw.window = fir_window_init(fftw.iq_size * (fftw.fft_size / 1024), 0);
+	//fftw.window_db_offset = -17.2f + decimation_db_offset; // -1: powf(-1, i)
+	fftw.window_db_offset = 25.8f + decimation_db_offset; // 0: blackman
+	fftw.window_iq_inverted = true;
+	// Allocating arrays with maximum count of elements (fft_size)
+	fftw.row32 = (float*) malloc(sizeof(float) * fftw.fft_size);
+	memset(fftw.row32, 0, sizeof(float) * fftw.fft_size);
+	fftw.row8 = (uint8_t*) malloc(sizeof(uint8_t) * fftw.fft_size);
+	memset(fftw.row8, 0, sizeof(uint8_t) * fftw.fft_size);
 }
 
 static void* tcp_worker(void* arg)
